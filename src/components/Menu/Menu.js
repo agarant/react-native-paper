@@ -10,13 +10,14 @@ import {
   TouchableWithoutFeedback,
   I18nManager,
   BackHandler,
-  StatusBar,
+  Platform,
 } from 'react-native';
 import { withTheme } from '../../core/theming';
 import type { Theme } from '../../types';
 import Portal from '../Portal/Portal';
 import Surface from '../Surface';
 import MenuItem from './MenuItem';
+import { APPROX_STATUSBAR_HEIGHT } from '../../constants';
 
 type Props = {
   /**
@@ -27,6 +28,13 @@ type Props = {
    * The anchor to open the menu from. In most cases, it will be a button that opens the manu.
    */
   anchor: React.Node,
+  /**
+   * Extra margin to add at the top of the menu to account for translucent status bar on Android.
+   * If you are using Expo, we assume translucent status bar and set a height for status bar automatically.
+   * Pass `0` or a custom value to and customize it.
+   * This is automatically handled on iOS.
+   */
+  statusBarHeight: number,
   /**
    * Callback called when Menu is dismissed. The `visible` prop needs to be updated when this is called.
    */
@@ -42,19 +50,18 @@ type Props = {
   theme: Theme,
 };
 
-type State = {
+type State = {|
   top: number,
   left: number,
-  menuLayout: { height: number, width: number },
-  anchorLayout: { height: number, width: number },
+  windowLayout: {| height: number, width: number |},
+  menuLayout: {| height: number, width: number |},
+  anchorLayout: {| height: number, width: number |},
   opacityAnimation: Animated.Value,
-  menuSizeAnimation: Animated.ValueXY,
-  menuState: 'hidden' | 'animating' | 'shown',
-};
+  scaleAnimation: Animated.ValueXY,
+|};
 
 // Minimum padding between the edge of the screen and the menu
 const SCREEN_INDENT = 8;
-
 // From https://material.io/design/motion/speed.html#duration
 const ANIMATION_DURATION = 250;
 // From the 'Standard easing' section of https://material.io/design/motion/speed.html#easing
@@ -72,7 +79,7 @@ const EASING = Easing.bezier(0.4, 0, 0.2, 1);
  * ```js
  * import * as React from 'react';
  * import { View } from 'react-native';
- * import { Button, Paragraph, Menu, Divider } from 'react-native-paper';
+ * import { Button, Paragraph, Menu, Divider, Provider } from 'react-native-paper';
  *
  * export default class MyComponent extends React.Component {
  *   state = {
@@ -85,20 +92,27 @@ const EASING = Easing.bezier(0.4, 0, 0.2, 1);
  *
  *   render() {
  *     return (
- *       <View>
- *         <Menu
- *           visible={this.state.visible}
- *           onDismiss={this._closeMenu}
- *           anchor={
- *             <Button onPress={this._openMenu}>Show menu</Button>
- *           }
- *         >
- *           <Menu.Item onPress={() => {}} title="Item 1" />
- *           <Menu.Item onPress={() => {}} title="Item 2" />
- *           <Divider />
- *           <Menu.Item onPress={() => {}} title="Item 3" />
- *         </Menu>
- *       </View>
+ *       <Provider>
+ *         <View
+ *           style={{
+ *             paddingTop: 50,
+ *             flexDirection: 'row',
+ *             justifyContent: 'center'
+ *           }}>
+ *           <Menu
+ *             visible={this.state.visible}
+ *             onDismiss={this._closeMenu}
+ *             anchor={
+ *               <Button onPress={this._openMenu}>Show menu</Button>
+ *             }
+ *           >
+ *             <Menu.Item onPress={() => {}} title="Item 1" />
+ *             <Menu.Item onPress={() => {}} title="Item 2" />
+ *             <Divider />
+ *             <Menu.Item onPress={() => {}} title="Item 3" />
+ *           </Menu>
+ *         </View>
+ *       </Provider>
  *     );
  *   }
  * }
@@ -108,14 +122,18 @@ class Menu extends React.Component<Props, State> {
   // @component ./MenuItem.js
   static Item = MenuItem;
 
+  static defaultProps = {
+    statusBarHeight: APPROX_STATUSBAR_HEIGHT,
+  };
+
   state = {
-    menuState: 'hidden',
     top: 0,
     left: 0,
+    windowLayout: { width: 0, height: 0 },
     menuLayout: { width: 0, height: 0 },
     anchorLayout: { width: 0, height: 0 },
     opacityAnimation: new Animated.Value(0),
-    menuSizeAnimation: new Animated.ValueXY({ x: 0, y: 0 }),
+    scaleAnimation: new Animated.ValueXY({ x: 0, y: 0 }),
   };
 
   componentDidUpdate(prevProps) {
@@ -124,44 +142,31 @@ class Menu extends React.Component<Props, State> {
     }
   }
 
-  _container: ?View;
+  componentWillUnmount() {
+    BackHandler.removeEventListener('hardwareBackPress', this._handleDismiss);
+    Dimensions.removeEventListener('change', this._handleDismiss);
+  }
 
-  // Start menu animation
-  _onMenuLayout = e => {
-    if (this.state.menuState === 'animating') {
-      return;
-    }
+  _anchor: ?View;
+  _menu: ?View;
 
-    const { width, height } = e.nativeEvent.layout;
-
-    this.setState(
-      {
-        menuState: 'animating',
-        menuLayout: { width, height },
-      },
-      () => {
-        Animated.parallel([
-          Animated.timing(this.state.menuSizeAnimation, {
-            toValue: { x: width, y: height },
-            duration: ANIMATION_DURATION,
-            easing: EASING,
-          }),
-          Animated.timing(this.state.opacityAnimation, {
-            toValue: 1,
-            duration: ANIMATION_DURATION,
-            easing: EASING,
-          }),
-        ]).start();
+  _measureMenuLayout = () =>
+    new Promise(resolve => {
+      if (this._menu) {
+        this._menu.measureInWindow((x, y, width, height) => {
+          resolve({ x, y, width, height });
+        });
       }
-    );
-  };
+    });
 
-  // Save anchor width and height for menu layout
-  _onAnchorLayout = e => {
-    const { width, height } = e.nativeEvent.layout;
-
-    this.setState({ anchorLayout: { width, height } });
-  };
+  _measureAnchorLayout = () =>
+    new Promise(resolve => {
+      if (this._anchor) {
+        this._anchor.measureInWindow((x, y, width, height) => {
+          resolve({ x, y, width, height });
+        });
+      }
+    });
 
   _updateVisibility = () => {
     if (this.props.visible) {
@@ -171,140 +176,273 @@ class Menu extends React.Component<Props, State> {
     }
   };
 
-  _show = () => {
-    BackHandler.addEventListener('hardwareBackPress', this._hide);
-
-    if (this._container) {
-      this._container.measureInWindow((x, y) => {
-        const top = Math.max(SCREEN_INDENT, y) + StatusBar.currentHeight;
-        const left = Math.max(SCREEN_INDENT, x);
-
-        this.setState({ menuState: 'shown', top, left });
-      });
+  _handleDismiss = () => {
+    if (this.props.visible) {
+      this.props.onDismiss();
     }
+    return true;
+  };
+
+  _show = async () => {
+    BackHandler.addEventListener('hardwareBackPress', this._handleDismiss);
+    Dimensions.addEventListener('change', this._handleDismiss);
+
+    const windowLayout = Dimensions.get('window');
+    const [menuLayout, anchorLayout] = await Promise.all([
+      this._measureMenuLayout(),
+      this._measureAnchorLayout(),
+    ]);
+
+    // When visible is true for first render
+    // native views can be still not rendered and
+    // measureMenuLayout/measureAnchorLayout functions
+    // return wrong values e.g { x:0, y: 0, width: 0, height: 0 }
+    // so we have to wait until views are ready
+    // and rerun this function to show menu
+    if (
+      !windowLayout.width ||
+      !windowLayout.height ||
+      !menuLayout.width ||
+      !menuLayout.height ||
+      !anchorLayout.width ||
+      !anchorLayout.height
+    ) {
+      BackHandler.removeEventListener('hardwareBackPress', this._handleDismiss);
+      setTimeout(this._show, ANIMATION_DURATION);
+      return;
+    }
+
+    this.setState(
+      {
+        left: anchorLayout.x,
+        top: anchorLayout.y,
+        windowLayout: {
+          height: windowLayout.height,
+          width: windowLayout.width,
+        },
+        anchorLayout: {
+          height: anchorLayout.height,
+          width: anchorLayout.width,
+        },
+        menuLayout: {
+          width: menuLayout.width,
+          height: menuLayout.height,
+        },
+      },
+      () => {
+        Animated.parallel([
+          Animated.timing(this.state.scaleAnimation, {
+            toValue: { x: menuLayout.width, y: menuLayout.height },
+            duration: ANIMATION_DURATION,
+            easing: EASING,
+            useNativeDriver: true,
+          }),
+          Animated.timing(this.state.opacityAnimation, {
+            toValue: 1,
+            duration: ANIMATION_DURATION,
+            easing: EASING,
+            useNativeDriver: true,
+          }),
+        ]).start();
+      }
+    );
   };
 
   _hide = () => {
-    BackHandler.removeEventListener('hardwareBackPress', this._hide);
+    BackHandler.removeEventListener('hardwareBackPress', this._handleDismiss);
+    Dimensions.removeEventListener('change', this._handleDismiss);
 
     Animated.timing(this.state.opacityAnimation, {
       toValue: 0,
       duration: ANIMATION_DURATION,
       easing: EASING,
-    }).start(() => {
-      if (this.props.visible && this.props.onDismiss) {
-        this.props.onDismiss();
-      }
-      if (this.props.visible) {
-        this._show();
-      } else {
-        this.setState({
-          menuState: 'hidden',
-          menuSizeAnimation: new Animated.ValueXY({ x: 0, y: 0 }),
-          opacityAnimation: new Animated.Value(0),
-        });
+      useNativeDriver: true,
+    }).start(finished => {
+      if (finished) {
+        this.state.scaleAnimation.setValue({ x: 0, y: 0 });
       }
     });
   };
 
   render() {
-    const { visible, anchor, style, children, theme } = this.props;
+    const {
+      visible,
+      anchor,
+      style,
+      children,
+      theme,
+      statusBarHeight,
+      onDismiss,
+    } = this.props;
 
     const {
-      menuState,
+      windowLayout,
       menuLayout,
       anchorLayout,
       opacityAnimation,
-      menuSizeAnimation,
+      scaleAnimation,
     } = this.state;
 
-    // Adjust position of menu
+    // I don't know why but on Android measure function is wrong by 24
+    const additionalVerticalValue = Platform.select({
+      android: statusBarHeight,
+      default: 0,
+    });
+
     let { left, top } = this.state;
-    const transforms = [];
 
-    const { width: screenWidth, height: screenHeight } = Dimensions.get(
-      'screen'
-    );
+    const scaleTransforms = [
+      {
+        scaleX: scaleAnimation.x.interpolate({
+          inputRange: [0, menuLayout.width],
+          outputRange: [0, 1],
+        }),
+      },
+      {
+        scaleY: scaleAnimation.y.interpolate({
+          inputRange: [0, menuLayout.height],
+          outputRange: [0, 1],
+        }),
+      },
+    ];
 
-    // Flip by X axis if menu hits right screen border
-    if (left > screenWidth - menuLayout.width - SCREEN_INDENT) {
-      transforms.push({
-        translateX: Animated.multiply(menuSizeAnimation.x, -1),
+    // We need to translate menu while animating scale to imitate transform origin for scale animation
+    const positionTransforms = [];
+
+    // Check if menu fits horizontally and if not align it to right.
+    if (left <= windowLayout.width - menuLayout.width - SCREEN_INDENT) {
+      positionTransforms.push({
+        translateX: scaleAnimation.x.interpolate({
+          inputRange: [0, menuLayout.width],
+          outputRange: [-(menuLayout.width / 2), 0],
+        }),
       });
 
-      left = Math.min(screenWidth - SCREEN_INDENT, left + anchorLayout.width);
+      // Check if menu position has enough space from left side
+      if (left >= 0 && left < SCREEN_INDENT) {
+        left = SCREEN_INDENT;
+      }
+    } else {
+      positionTransforms.push({
+        translateX: scaleAnimation.x.interpolate({
+          inputRange: [0, menuLayout.width],
+          outputRange: [menuLayout.width / 2, 0],
+        }),
+      });
+
+      left += anchorLayout.width - menuLayout.width;
+
+      const right = left + menuLayout.width;
+      // Check if menu position has enough space from right side
+      if (
+        right <= windowLayout.width &&
+        right > windowLayout.width - SCREEN_INDENT
+      ) {
+        left = windowLayout.width - SCREEN_INDENT - menuLayout.width;
+      }
     }
 
-    // Flip by Y axis if menu hits bottom screen border
-    if (top > screenHeight - menuLayout.height - SCREEN_INDENT) {
-      transforms.push({
-        translateY: Animated.multiply(menuSizeAnimation.y, -1),
+    // Check if menu fits vertically and if not align it to bottom.
+    if (top <= windowLayout.height - menuLayout.height - SCREEN_INDENT) {
+      positionTransforms.push({
+        translateY: scaleAnimation.y.interpolate({
+          inputRange: [0, menuLayout.height],
+          outputRange: [-(menuLayout.height / 2), 0],
+        }),
       });
 
-      top = Math.min(screenHeight - SCREEN_INDENT, top + anchorLayout.height);
+      // Check if menu position has enough space from top side
+      if (top >= 0 && top < SCREEN_INDENT) {
+        top = SCREEN_INDENT;
+      }
+    } else {
+      positionTransforms.push({
+        translateY: scaleAnimation.y.interpolate({
+          inputRange: [0, menuLayout.height],
+          outputRange: [menuLayout.height / 2, 0],
+        }),
+      });
+
+      top += anchorLayout.height - menuLayout.height;
+
+      const bottom = top + menuLayout.height + additionalVerticalValue;
+      // Check if menu position has enough space from bottom side
+      if (
+        bottom <= windowLayout.height &&
+        bottom > windowLayout.height - SCREEN_INDENT
+      ) {
+        top =
+          windowLayout.height -
+          SCREEN_INDENT -
+          menuLayout.height -
+          additionalVerticalValue;
+      }
     }
 
     const shadowMenuContainerStyle = {
       opacity: opacityAnimation,
-      transform: transforms,
+      transform: scaleTransforms,
       borderRadius: theme.roundness,
-      top,
+    };
+
+    const positionStyle = {
+      top: top + additionalVerticalValue,
       ...(I18nManager.isRTL ? { right: left } : { left }),
     };
 
-    const animationStarted = menuState === 'animating';
-    const menuVisible = menuState === 'shown' || animationStarted || visible;
-
     return (
       <View
-        ref={c => {
-          this._container = c;
+        ref={ref => {
+          this._anchor = ref;
         }}
         collapsable={false}
-        onLayout={this._onAnchorLayout}
       >
         {anchor}
-        {menuVisible ? (
-          <Portal>
-            <TouchableWithoutFeedback onPress={this._hide}>
+        <Portal>
+          {visible ? (
+            <TouchableWithoutFeedback onPress={onDismiss}>
               <View style={StyleSheet.absoluteFill} />
             </TouchableWithoutFeedback>
-            <Surface
-              onLayout={this._onMenuLayout}
-              style={[
-                styles.shadowMenuContainer,
-                shadowMenuContainerStyle,
-                style,
-              ]}
-            >
-              <Animated.View
-                style={[
-                  styles.menuContainer,
-                  animationStarted && {
-                    width: menuSizeAnimation.x,
-                    height: menuSizeAnimation.y,
-                  },
-                ]}
+          ) : null}
+          <View
+            ref={ref => {
+              // This hack is needed to properly show menu
+              // when visible is `true` initially
+              // because in componentDidMount _menu ref is undefined
+              // because it's rendered in portal
+              if (!this._menu) {
+                this._menu = ref;
+                if (visible) {
+                  this._show();
+                }
+              }
+            }}
+            collapsable={false}
+            pointerEvents={visible ? 'auto' : 'none'}
+            style={[styles.wrapper, positionStyle, style]}
+          >
+            <Animated.View style={{ transform: positionTransforms }}>
+              <Surface
+                style={[styles.shadowMenuContainer, shadowMenuContainerStyle]}
               >
                 {children}
-              </Animated.View>
-            </Surface>
-          </Portal>
-        ) : null}
+              </Surface>
+            </Animated.View>
+          </View>
+        </Portal>
       </View>
     );
   }
 }
 
 const styles = StyleSheet.create({
-  shadowMenuContainer: {
+  wrapper: {
     position: 'absolute',
-    opacity: 0,
-    paddingTop: 8,
-    elevation: 8,
   },
-  menuContainer: {
-    overflow: 'hidden',
+  shadowMenuContainer: {
+    opacity: 0,
+    paddingVertical: 8,
+    elevation: 8,
   },
 });
 
